@@ -123,7 +123,7 @@ python inference.py --source_domains ADAM --target_domains IXI-HH ICBM --model R
 
 ## Notes
 
-- The current DyCo-CTA implementation is centered in [main/dyco_cta.py](C:\Users\Admin\Desktop\DyCo-CTA\main\dyco_cta.py).
+- The current DyCo-CTA implementation is centered in dyco_cta.py.
 - Topology regularization is optional. If `cripser` or `gudhi` is unavailable, the script will skip that term and print a warning.
 - `wandb` defaults to offline mode unless you explicitly change `WANDB_MODE`.
 
