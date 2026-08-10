@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import wandb
 from tqdm import tqdm
 
 from dataloaders.TTA_dataloader import TTA_dataloader
@@ -43,7 +42,7 @@ class CoTTA3D:
         self.setup_cotta_models()
 
     def build_model(self):
-        source_model_path = os.path.join(args.model_root, args.model, f'source_{'_'.join(args.source_domains)}.pth')
+        source_model_path = os.path.join(args.model_root, args.model, f"source_{'_'.join(args.source_domains)}.pth")
         
         model_module = importlib.import_module(f"networks.{args.model}")
         Model = getattr(model_module, args.model)
@@ -231,16 +230,6 @@ class CoTTA3D:
             for key in all_metrics:
                 all_metrics[key].append(metrics_student[key])
 
-            # WandB 记录：把 Student 的指标画出来，你就能看到红线和绿线分开了
-            wandb.log({
-                "Train Dice": metrics_student['dice'],
-                "Train IoU": metrics_student['iou'],
-                "Train HD95": metrics_student['hd95'],
-                "Total Loss": loss_val,
-                # 如果你想对比，可以同时记录 Teacher
-                # "Teacher Dice": metrics_teacher['dice'], 
-            })
-
         # Final Summary
         avg_metrics = {key: np.mean(values) for key, values in all_metrics.items()}
         print("\n=== CoTTA Adaptation Finished ===")
@@ -296,15 +285,5 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # WandB
-    run = wandb.init(
-        project="dyco-cta-cotta",
-        name=f"{'_'.join(args.source_domains)}_cotta",
-        config={
-            "dataset": "vessel_segmentation",
-            "batch_size": args.batch_size,
-        },
-        mode=os.environ.get("WANDB_MODE", "offline")
-    )
     runner = CoTTA3D(args)
     runner.run()

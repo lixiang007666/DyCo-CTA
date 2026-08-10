@@ -1,136 +1,70 @@
 # DyCo-CTA
 
-DyCo-CTA is a dynamic collaborative continual test-time adaptation framework for 3D vessel segmentation.
+Official implementation of **Dynamic Collaborative Continual Test-Time Adaptation for 3D Vessel Segmentation**.
 
-## Overview
+DyCo-CTA adapts a source-trained 3D vessel segmentation model to a non-stationary stream of unlabeled target volumes. It combines three components:
 
-Morphological characteristics of vessels are important biomarkers for many diseases, which makes accurate vessel segmentation a key step in computer-aided diagnosis. In real deployment, however, cross-center domain shifts often degrade segmentation performance. Continual Test-Time Adaptation (CTA) addresses this by updating the model online with unlabeled target-domain test data, but standard CTA can easily introduce topology-breaking artifacts such as vessel disconnections and spurious branches.
+- dynamic teacher-student role assignment using volume-averaged prediction entropy;
+- pseudo-break transformation using vessel removal, inpainting, and local Gaussian blending;
+- persistence-diagram regularization for matching stable structures and removing topological noise.
 
-This project implements **DyCo-CTA**, which extends a source-trained 3D segmentation model with:
+## Installation
 
-- **Dynamic collaborative adaptation**: two subnetworks are initialized from the same source model and dynamically swap teacher-student roles according to prediction entropy on the original volume.
-- **Pseudo-break transformation**: a structure-aware perturbation creates complementary inputs that simulate local vessel interruption and encourage structural integrity.
-- **Topological regularization**: a topology consistency loss aligns critical topological points beyond voxel-level supervision.
-
-
-## Dynamic Collaborative Mechanism
-
-At each adaptation step, the framework builds an original input volume `x` and a pseudo-break view `x_pb`.
-
-Both subnetworks `M1` and `M2` process both inputs:
-
-- `Y^(1), Y_pb^(1) = M1(x), M1(x_pb)`
-- `Y^(2), Y_pb^(2) = M2(x), M2(x_pb)`
-
-Teacher-student roles are assigned dynamically by comparing the volume-averaged entropy on the original volume:
-
-- lower entropy -> higher confidence
-- the lower-entropy model becomes the teacher for the current step
-- the higher-entropy model becomes the student for the current step
-
-The detached teacher prediction on `x_pb` supervises the student prediction on `x_pb`, and only the current student is updated. The student is also optimized with an entropy minimization term on the original volume. Optional topology regularization is applied between teacher and student foreground probabilities on the pseudo-break view.
-
-## Environment
-
-Recommended Python version: `3.9+`
-
-Core dependencies used by the current implementation:
+The experiments use Python 3.10, PyTorch 2.4.0, and CUDA 12.4. A reproducible Conda specification is provided in `environment.yml`.
 
 ```bash
-pip install torch torchvision monai nibabel numpy tqdm wandb
-pip install cripser gudhi ripser connected-components-3d opencv-python scipy SimpleITK
+conda env create -f environment.yml
+conda activate dyco-cta
 ```
 
+## Data
 
-## Data and Paths
-
-The code now avoids hard-coded personal paths.
-
-Default dataset root:
-
-```bash
-data/TTA_dataset
-```
-
-You can override paths with environment variables:
-
-```bash
-set DYCO_CTA_DATASET_ROOT=your_dataset_root
-set DYCO_CTA_PRETRAINED_ENCODER=your_pretrained_encoder_path
-set WANDB_MODE=offline
-```
-
-On PowerShell:
-
-```powershell
-$env:DYCO_CTA_DATASET_ROOT="path\\to\\TTA_dataset"
-$env:DYCO_CTA_PRETRAINED_ENCODER="path\\to\\resnet3d_50.pth"
-$env:WANDB_MODE="offline"
-```
-
-Expected dataset structure for `main/dataloaders/TTA_dataloader.py`:
+Datasets and model weights are not distributed in this repository. Arrange preprocessed volumes as follows:
 
 ```text
-TTA_dataset/
-  imagesTr/
-    DOMAIN_A/
-    DOMAIN_B/
-  labelsTr/
-    DOMAIN_A/
-    DOMAIN_B/
-  imagesTs/
-    DOMAIN_A/
-    DOMAIN_B/
-  labelsTs/
-    DOMAIN_A/
-    DOMAIN_B/
+data/TTA_dataset/
+├── imagesTr/<domain>/*.nii.gz
+├── labelsTr/<domain>/*.nii.gz
+├── imagesTs/<domain>/*.nii.gz
+└── labelsTs/<domain>/*.nii.gz
 ```
 
-## Usage
+The code recognizes the domains used in the paper, including `IXI-HH`, `IXI-Guys`, `IXI-IOP`, `LocH1`, `ICBM`, and `ADAM`. Set a different dataset location with `--dataset_root` or `DYCO_CTA_DATASET_ROOT`.
 
-### 1. Train the source model
-
-```bash
-python train_source.py --source_domains ADAM --model ResUnet3d
-```
-
-This saves the source checkpoint under:
+Source checkpoints follow this naming convention:
 
 ```text
-models/source_train/<ModelName>/source_<domains>.pth
+models/source_train/ResUnet3d/source_<domain>.pth
 ```
 
-### 2. Run DyCo-CTA adaptation
+Each checkpoint must contain a `model_state_dict` entry.
+
+## Source training
 
 ```bash
-python dyco_cta.py --source_domains ADAM --target_domains IXI-HH IXI-Guys ICBM --model ResUnet3d
+python train_source.py \
+  --source_domains ADAM \
+  --model ResUnet3d \
+  --lr 0.01
 ```
 
-Useful arguments:
-
-- `--consistency_weight`: weight of the teacher-relation loss on the pseudo-break view
-- `--entropy_weight`: weight of the student entropy minimization loss
-- `--topology_weight`: weight of the topology regularization term
-- `--break_regions`: number of pseudo-break regions
-- `--break_roi_size`: pseudo-break region size
-- `--confidence_threshold`: confidence mask threshold for teacher supervision
-
-### 3. Run source-model inference
+## Continual test-time adaptation
 
 ```bash
-python inference.py --source_domains ADAM --target_domains IXI-HH ICBM --model ResUnet3d
+python dyco_cta.py \
+  --source_domains ADAM \
+  --target_domains IXI-HH IXI-Guys IXI-IOP LocH1 ICBM \
+  --model ResUnet3d
 ```
 
-## Notes
+The defaults reproduce the adaptation settings reported in the paper: batch size 1, four updates per test volume, learning rate `1e-4`, pseudo-label threshold `0.5`, three mask-dilation iterations, `15 x 15` pseudo-break patches, and persistence threshold `0.7`.
 
-- The current DyCo-CTA implementation is centered in dyco_cta.py.
-- Topology regularization is optional. If `cripser` or `gudhi` is unavailable, the script will skip that term and print a warning.
-- `wandb` defaults to offline mode unless you explicitly change `WANDB_MODE`.
+Use `inference.py` to evaluate a source model without adaptation.
 
-## Status
+## Acknowledgements
 
-The repository currently includes:
+The dynamic collaboration design builds on [DiCo](https://github.com/xujiaommcome/DiCo), and the pseudo-break transformation builds on [CoLeTra](https://github.com/jmlipman/CoLeTra).
 
-- pseudo-break view generation
-- topology consistency loss
-- dynamic teacher-student role switching based on entropy
+## Citation
+
+Citation information will be added after publication.

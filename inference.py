@@ -5,7 +5,6 @@ import importlib
 import torch
 import numpy as np
 
-import wandb
 from tqdm import tqdm
 
 from dataloaders.TTA_dataloader import TTA_dataloader
@@ -36,7 +35,7 @@ class Inference:
         self.build_model()
 
     def build_model(self):
-        source_model_path = os.path.join(args.model_root, args.model, f'source_{'_'.join(args.source_domains)}.pth')
+        source_model_path = os.path.join(args.model_root, args.model, f"source_{'_'.join(args.source_domains)}.pth")
         
         model_module = importlib.import_module(f"networks.{args.model}")
         Model = getattr(model_module, args.model)
@@ -82,13 +81,6 @@ class Inference:
             for key in all_metrics:
                 all_metrics[key].append(metrics[key])
 
-            # log to wandb
-            wandb.log({
-                "Train Dice": metrics['dice'],
-                "Train IoU": metrics['iou'],
-                "Train HD95": metrics['hd95'],
-            })
-
         avg_metrics = {key: np.mean(values) for key, values in all_metrics.items()}
 
         print(f"Dice: {avg_metrics['dice']:.4f}")
@@ -102,7 +94,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     # Dataset
-    parser.add_argument('--source_domains', type=str, nargs='+', default=['ADAM''IXI-HH'], 
+    parser.add_argument('--source_domains', type=str, nargs='+', default=['ADAM'],
                        help='Space-separated list of source domains')
     parser.add_argument('--target_domains', type=str, nargs='+', default=['IXI-HH', 'IXI-Guys', 'IXI-IOP', 'LocH1', 'ICBM'], 
                        help='Space-separated list of target domains')
@@ -130,17 +122,6 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda:0')
 
     args = parser.parse_args()
-
-    # Start a new wandb run to track this script.
-    run = wandb.init(
-        project="dyco-cta-inference",
-        name=f"{'_'.join(args.source_domains)}_BN",
-        config={
-            "dataset": "vessel_segmentation",
-            "batch_size": args.batch_size,
-        },
-        mode=os.environ.get("WANDB_MODE", "offline"),
-    )
 
     inference = Inference(args)
 

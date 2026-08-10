@@ -7,12 +7,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
 from tqdm import tqdm
 
 from dataloaders.TTA_dataloader import TTA_dataloader
 from utils.metrics import compute_metrics, set_seed
-from utils.structural_perturbation import build_pseudo_break_view
+from utils.structural_perturbation import build_inpainted_view, build_pseudo_break_view
 from utils.topology_regularization import TOPOLOGY_BACKEND_AVAILABLE, topology_consistency_loss
 
 torch.set_num_threads(1)
@@ -52,8 +51,9 @@ class DyCoCTA3D:
 
         self.anchor_primary = copy.deepcopy(self.model_primary)
         self.anchor_auxiliary = copy.deepcopy(self.model_auxiliary)
+        self.source_model = copy.deepcopy(self.model_primary).eval()
 
-        for anchor in (self.anchor_primary, self.anchor_auxiliary):
+        for anchor in (self.anchor_primary, self.anchor_auxiliary, self.source_model):
             for param in anchor.parameters():
                 param.requires_grad = False
                 param.detach_()
@@ -110,26 +110,15 @@ class DyCoCTA3D:
         confidence_mask = (teacher_confidence > self.args.confidence_threshold).float()
         return (relation_map * confidence_mask).sum() / confidence_mask.sum().clamp_min(1.0)
 
-    def _build_views(self, images: torch.Tensor):
+    def _build_inpainted(self, images: torch.Tensor):
         with torch.no_grad():
-            logits_primary = self.model_primary(images)
-            logits_auxiliary = self.model_auxiliary(images)
-            vessel_prob = 0.5 * (
-                F.softmax(logits_primary, dim=1)[:, 1:2] + F.softmax(logits_auxiliary, dim=1)[:, 1:2]
-            )
-            vessel_mask = (vessel_prob > self.args.break_mask_threshold).float()
-
-        break_view = build_pseudo_break_view(
-            images,
-            vessel_mask=vessel_mask,
-            num_regions=self.args.break_regions,
-            roi_size=self.args.break_roi_size,
-            break_strength=self.args.break_strength,
+            source_prob = F.softmax(self.source_model(images), dim=1)[:, 1:2]
+            source_mask = (source_prob > self.args.break_mask_threshold).float()
+        return build_inpainted_view(
+            images, source_mask, dilation_iterations=self.args.inpaint_dilation
         )
-        return images, break_view
 
     def run(self):
-        _, _ = TTA_dataloader(self.args, self.args.source_domains)
         train_loader, _ = TTA_dataloader(self.args, self.args.target_domains)
 
         self.model_primary.train()
@@ -141,64 +130,69 @@ class DyCoCTA3D:
         for batch_idx, (images, labels, _) in progress_bar:
             images = images.to(self.device)
             labels = labels.to(self.device)
+            inpainted = self._build_inpainted(images)
 
-            original_view, break_view = self._build_views(images)
+            for _ in range(self.args.adaptation_steps):
+                logits_original_primary = self.model_primary(images)
+                logits_original_auxiliary = self.model_auxiliary(images)
+                entropy_primary = self._volume_entropy(logits_original_primary)
+                entropy_auxiliary = self._volume_entropy(logits_original_auxiliary)
+                primary_is_teacher = bool(entropy_primary.mean() <= entropy_auxiliary.mean())
 
-            logits_original_primary = self.model_primary(original_view)
-            logits_original_auxiliary = self.model_auxiliary(original_view)
-            logits_break_primary = self.model_primary(break_view)
-            logits_break_auxiliary = self.model_auxiliary(break_view)
+                if primary_is_teacher:
+                    teacher_model, student_model = self.model_primary, self.model_auxiliary
+                    teacher_logits_original, student_logits_original = logits_original_primary, logits_original_auxiliary
+                    student_optimizer, student_anchor, role_flag = self.optimizer_auxiliary, self.anchor_auxiliary, "M1->M2"
+                else:
+                    teacher_model, student_model = self.model_auxiliary, self.model_primary
+                    teacher_logits_original, student_logits_original = logits_original_auxiliary, logits_original_primary
+                    student_optimizer, student_anchor, role_flag = self.optimizer_primary, self.anchor_primary, "M2->M1"
 
-            entropy_primary = self._volume_entropy(logits_original_primary)
-            entropy_auxiliary = self._volume_entropy(logits_original_auxiliary)
-            primary_is_teacher = bool((entropy_primary <= entropy_auxiliary).float().mean().item() >= 0.5)
+                with torch.no_grad():
+                    teacher_mask = (
+                        F.softmax(teacher_logits_original, dim=1)[:, 1:2]
+                        > self.args.break_mask_threshold
+                    ).float()
+                    break_view = build_pseudo_break_view(
+                        images,
+                        inpainted,
+                        teacher_mask,
+                        num_centers=self.args.break_regions,
+                        patch_size=self.args.break_patch_size,
+                        sigma=self.args.break_sigma,
+                    )
+                    teacher_logits_break = teacher_model(break_view)
+                student_logits_break = student_model(break_view)
 
-            if primary_is_teacher:
-                teacher_logits_original = logits_original_primary
-                teacher_logits_break = logits_break_primary
-                student_logits_original = logits_original_auxiliary
-                student_logits_break = logits_break_auxiliary
-                student_model = self.model_auxiliary
-                student_optimizer = self.optimizer_auxiliary
-                student_anchor = self.anchor_auxiliary
-                role_flag = "P->A"
-            else:
-                teacher_logits_original = logits_original_auxiliary
-                teacher_logits_break = logits_break_auxiliary
-                student_logits_original = logits_original_primary
-                student_logits_break = logits_break_primary
-                student_model = self.model_primary
-                student_optimizer = self.optimizer_primary
-                student_anchor = self.anchor_primary
-                role_flag = "A->P"
+                teacher_relation_loss = self._teacher_relation_loss(teacher_logits_break, student_logits_break)
+                student_entropy_loss = self._entropy_objective(student_logits_original)
+                total_loss = self.args.entropy_weight * student_entropy_loss
+                total_loss = total_loss + self.args.consistency_weight * teacher_relation_loss
 
-            teacher_relation_loss = self._teacher_relation_loss(teacher_logits_break, student_logits_break)
-            student_entropy_loss = self._entropy_objective(student_logits_original)
-            total_loss = self.args.entropy_weight * student_entropy_loss
-            total_loss = total_loss + self.args.consistency_weight * teacher_relation_loss
+                topo_loss_value = images.new_zeros(())
+                if self.args.topology_weight > 0:
+                    teacher_vessel_prob = F.softmax(teacher_logits_break, dim=1)[:, 1]
+                    student_vessel_prob = F.softmax(student_logits_break, dim=1)[:, 1]
+                    topo_loss_value = topology_consistency_loss(
+                        student_vessel_prob,
+                        teacher_vessel_prob,
+                        patch_size=self.args.topology_patch_size,
+                        persistence_threshold=self.args.topology_persistence,
+                        max_slices=self.args.topology_max_slices,
+                    )
+                    total_loss = total_loss + self.args.topology_weight * topo_loss_value
 
-            topo_loss_value = images.new_zeros(())
-            if self.args.topology_weight > 0:
-                teacher_vessel_prob = F.softmax(teacher_logits_break.detach(), dim=1)[:, 1]
-                student_vessel_prob = F.softmax(student_logits_break, dim=1)[:, 1]
-                topo_loss_value = topology_consistency_loss(
-                    student_vessel_prob,
-                    teacher_vessel_prob,
-                    patch_size=self.args.topology_patch_size,
-                    persistence_threshold=self.args.topology_persistence,
-                    max_slices=self.args.topology_max_slices,
-                )
-                total_loss = total_loss + self.args.topology_weight * topo_loss_value
+                self.optimizer_primary.zero_grad(set_to_none=True)
+                self.optimizer_auxiliary.zero_grad(set_to_none=True)
+                total_loss.backward()
+                student_optimizer.step()
 
-            self.optimizer_primary.zero_grad()
-            self.optimizer_auxiliary.zero_grad()
-            total_loss.backward()
-            student_optimizer.step()
-
-            self._stochastic_restore(student_model, student_anchor)
+                self._stochastic_restore(student_model, student_anchor)
 
             with torch.no_grad():
-                selected_logits = teacher_logits_original
+                final_primary = self.model_primary(images)
+                final_auxiliary = self.model_auxiliary(images)
+                selected_logits = final_primary if self._volume_entropy(final_primary).mean() <= self._volume_entropy(final_auxiliary).mean() else final_auxiliary
                 metrics = compute_metrics(selected_logits, labels, self.args.out_ch)
 
             progress_bar.set_postfix_str(
@@ -207,23 +201,6 @@ class DyCoCTA3D:
 
             for key in all_metrics:
                 all_metrics[key].append(metrics[key])
-
-            wandb.log(
-                {
-                    "dice": metrics["dice"],
-                    "iou": metrics["iou"],
-                    "hd95": metrics["hd95"],
-                    "total_loss": total_loss.item(),
-                    "trl_loss": teacher_relation_loss.item(),
-                    "student_entropy_loss": student_entropy_loss.item(),
-                    "entropy_primary": entropy_primary.mean().item(),
-                    "entropy_auxiliary": entropy_auxiliary.mean().item(),
-                    "topology_loss": float(topo_loss_value.item()) if torch.is_tensor(topo_loss_value) else float(topo_loss_value),
-                    "role_primary_teacher": int(primary_is_teacher),
-                    "teacher_entropy": entropy_primary.mean().item() if primary_is_teacher else entropy_auxiliary.mean().item(),
-                    "student_entropy": entropy_auxiliary.mean().item() if primary_is_teacher else entropy_primary.mean().item(),
-                }
-            )
 
         avg_metrics = {key: float(np.mean(values)) for key, values in all_metrics.items()}
         print("\n=== DyCo-CTA Adaptation Finished ===")
@@ -247,7 +224,7 @@ def build_parser():
     parser.add_argument("--out_ch", type=int, default=2)
 
     parser.add_argument("--optimizer", type=str, default="Adam")
-    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.999)
@@ -263,15 +240,17 @@ def build_parser():
     parser.add_argument("--consistency_weight", type=float, default=1.0)
     parser.add_argument("--topology_weight", type=float, default=0.05)
     parser.add_argument("--restoration_factor", type=float, default=0.01)
-    parser.add_argument("--confidence_threshold", type=float, default=0.65)
+    parser.add_argument("--confidence_threshold", type=float, default=0.0)
 
     parser.add_argument("--break_regions", type=int, default=6)
-    parser.add_argument("--break_roi_size", type=int, nargs="+", default=[16, 16, 16])
-    parser.add_argument("--break_strength", type=float, default=0.85)
+    parser.add_argument("--adaptation_steps", type=int, default=4)
+    parser.add_argument("--break_patch_size", type=int, default=15)
+    parser.add_argument("--break_sigma", type=float, default=3.0)
     parser.add_argument("--break_mask_threshold", type=float, default=0.5)
+    parser.add_argument("--inpaint_dilation", type=int, default=3)
 
     parser.add_argument("--topology_patch_size", type=int, default=96)
-    parser.add_argument("--topology_persistence", type=float, default=0.1)
+    parser.add_argument("--topology_persistence", type=float, default=0.7)
     parser.add_argument("--topology_max_slices", type=int, default=4)
     return parser
 
@@ -280,12 +259,5 @@ if __name__ == "__main__":
     set_seed()
     parser = build_parser()
     args = parser.parse_args()
-
-    wandb.init(
-        project="DyCo-CTA",
-        name=f"{'_'.join(args.source_domains)}_to_{'_'.join(args.target_domains)}_{args.model}",
-        config=vars(args),
-        mode=os.environ.get("WANDB_MODE", "offline"),
-    )
 
     DyCoCTA3D(args).run()

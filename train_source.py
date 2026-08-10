@@ -5,7 +5,6 @@ import argparse
 import torch
 import numpy as np
 
-import wandb
 from tqdm import tqdm
 
 from dataloaders.TTA_dataloader import TTA_dataloader
@@ -157,18 +156,6 @@ def main(args):
             }, best_model_path)
             print(f"Best model saved at {best_model_path}")
         
-        # log to wandb
-        wandb.log({
-            "Train Loss": train_metrics['loss'],
-            "Train Dice": train_metrics['dice'],
-            "Train IoU": train_metrics['iou'],
-            "Train HD95": train_metrics['hd95'],
-            "Val Loss": val_metrics['loss'],
-            "Val Dice": val_metrics['dice'],
-            "Val IoU": val_metrics['iou'],
-            "Val HD95": val_metrics['hd95'],
-        })
-
         print(f"Train Loss: {train_metrics['loss']:.4f}, Val Loss: {val_metrics['loss']:.4f}")
         print(f"Train Dice: {train_metrics['dice']:.4f}, Val Dice: {val_metrics['dice']:.4f}")
         print(f"Train IoU: {train_metrics['iou']:.4f}, Val IoU: {val_metrics['iou']:.4f}")
@@ -199,7 +186,7 @@ if __name__ == '__main__':
 
     # Optimizer
     parser.add_argument('--optimizer', type=str, default='Adam', help='SGD/Adam')
-    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--lr', type=float, default=0.01)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--beta1', type=float, default=0.9)
     parser.add_argument('--beta2', type=float, default=0.999)
@@ -220,18 +207,4 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     
-    # Start a new wandb run to track this script.
-    run = wandb.init(
-        project="dyco-cta-source",
-        name=f"{'_'.join(args.source_domains)}_new",
-        config={
-            "learning_rate": args.lr,
-            "dataset": "vessel_segmentation",
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "optimizer": args.optimizer
-        },
-        mode=os.environ.get("WANDB_MODE", "offline")
-    )
-
     main(args)

@@ -1,6 +1,15 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
+*.pth
+*.pt
+*.ckpt
+wandb/
+runs/
+logs/
+outputs/
+results/
+data/TTA_dataset/
 *$py.class
 
 # C extensions

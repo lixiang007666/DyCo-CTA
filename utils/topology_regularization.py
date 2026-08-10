@@ -22,7 +22,7 @@ def _critical_points(likelihood: np.ndarray, persistence_threshold: float):
     zero_dim = pd[pd[:, 0] == 0]
     if zero_dim.size == 0:
         empty_points = np.zeros((0, 2))
-        return empty_points, empty_points, empty_points, np.array([], dtype=int)
+        return empty_points, empty_points, empty_points, np.array([], dtype=int), np.array([], dtype=int)
 
     diagram = zero_dim[:, 1:3].copy()
     diagram[:, 1] = np.minimum(diagram[:, 1], 1.0)
@@ -30,7 +30,8 @@ def _critical_points(likelihood: np.ndarray, persistence_threshold: float):
     deaths = zero_dim[:, 6:8].astype(int)
     persistence = np.abs(diagram[:, 1] - diagram[:, 0])
     valid_idx = np.where(persistence > persistence_threshold)[0]
-    return diagram, births, deaths, valid_idx
+    noise_idx = np.where(persistence <= persistence_threshold)[0]
+    return diagram, births, deaths, valid_idx, noise_idx
 
 
 def _matching(student_diagram: np.ndarray, teacher_diagram: np.ndarray):
@@ -69,16 +70,16 @@ def _slice_topology_loss(
             if tea_patch.min() >= 1.0 or tea_patch.max() <= 0.0:
                 continue
 
-            stu_dgm, stu_birth, stu_death, stu_valid = _critical_points(stu_patch, persistence_threshold)
-            tea_dgm, _, _, tea_valid = _critical_points(tea_patch, persistence_threshold)
-            if stu_dgm.shape[0] == 0 or tea_dgm.shape[0] == 0:
+            stu_dgm, stu_birth, stu_death, stu_valid, stu_noise = _critical_points(stu_patch, persistence_threshold)
+            tea_dgm, _, _, tea_valid, _ = _critical_points(tea_patch, persistence_threshold)
+            if stu_dgm.shape[0] == 0:
                 continue
 
             student_match_space = stu_dgm[stu_valid]
             teacher_match_space = tea_dgm[tea_valid]
             to_remove, paired = _matching(student_match_space, teacher_match_space)
 
-            resolved_remove = []
+            resolved_remove = [int(index) for index in stu_noise]
             for idx in to_remove:
                 global_idx = np.where(np.all(stu_dgm == student_match_space[idx], axis=1))[0]
                 if global_idx.size > 0:

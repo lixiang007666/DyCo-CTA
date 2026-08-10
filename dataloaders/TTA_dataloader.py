@@ -31,7 +31,7 @@ class TTADataset(Dataset):
             domain_path = os.path.join(self.data_root, domain)
             labels_domain_path = os.path.join(self.labels_root, domain)
             if os.path.exists(domain_path):
-                for file_name in os.listdir(domain_path):
+                for file_name in sorted(os.listdir(domain_path)):
                     if file_name.endswith('.nii.gz') or file_name.endswith('.nii'):
                         self.image_paths.append(os.path.join(domain_path, file_name))
                         self.domain_labels.append(domain)
@@ -169,8 +169,8 @@ def get_transforms(args, augmentation=False):
             transforms.ToTensord(keys=["image", "label"]),
             transforms.CropForegroundd(
                 keys=["image", "label"],
-                source_key="label",
-                select_fn=lambda x: x > 0),
+                source_key="image",
+                select_fn=lambda x: x != 0),
             transforms.Resized(
                 keys=["image", "label"],
                 spatial_size=args.image_size, 

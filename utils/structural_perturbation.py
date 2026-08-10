@@ -1,80 +1,97 @@
-import random
-from typing import Sequence
+from __future__ import annotations
 
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 
-def _normalize_roi_size(roi_size: Sequence[int] | int) -> tuple[int, int, int]:
-    if isinstance(roi_size, int):
-        return (roi_size, roi_size, roi_size)
-    if len(roi_size) != 3:
-        raise ValueError("roi_size must be an int or a sequence of length 3.")
-    return tuple(int(v) for v in roi_size)
+def _dilate(mask: torch.Tensor, iterations: int = 3) -> torch.Tensor:
+    result = mask.float()
+    for _ in range(iterations):
+        result = F.max_pool3d(result, kernel_size=3, stride=1, padding=1)
+    return result
 
 
-def _sample_centers(mask: torch.Tensor, num_regions: int) -> torch.Tensor:
-    coords = torch.nonzero(mask > 0, as_tuple=False)
-    if coords.numel() == 0:
-        return coords
+def _inpaint_volume(image: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Apply Telea inpainting independently to the three orthogonal planes."""
+    image_np = image.detach().float().cpu().numpy()
+    mask_np = (mask.detach().cpu().numpy() > 0).astype(np.uint8) * 255
+    estimates = []
 
-    num_regions = min(num_regions, coords.shape[0])
-    select_ids = torch.randperm(coords.shape[0], device=coords.device)[:num_regions]
-    return coords[select_ids]
+    for axis in range(3):
+        volume = np.moveaxis(image_np, axis, 0)
+        volume_mask = np.moveaxis(mask_np, axis, 0)
+        restored = np.empty_like(volume, dtype=np.float32)
+        for index, (plane, plane_mask) in enumerate(zip(volume, volume_mask)):
+            if plane_mask.any():
+                restored[index] = cv2.inpaint(
+                    plane.astype(np.float32), plane_mask, 3, cv2.INPAINT_TELEA
+                )
+            else:
+                restored[index] = plane
+        estimates.append(np.moveaxis(restored, 0, axis))
+
+    inpainted = np.mean(estimates, axis=0)
+    return torch.as_tensor(inpainted, dtype=image.dtype, device=image.device)
 
 
-def build_pseudo_break_view(
-    image: torch.Tensor,
-    vessel_mask: torch.Tensor,
-    num_regions: int = 6,
-    roi_size: Sequence[int] | int = (16, 16, 16),
-    break_strength: float = 0.85,
+@torch.no_grad()
+def build_inpainted_view(
+    images: torch.Tensor,
+    source_vessel_mask: torch.Tensor,
+    dilation_iterations: int = 3,
 ) -> torch.Tensor:
-    """
-    Build a complementary pseudo-break view by replacing vessel-centered cuboids
-    with a smoothed version of the input, encouraging the peer network to
-    preserve structure under partial vessel disruptions.
-    """
-    if image.ndim != 5:
-        raise ValueError("image must be a 5D tensor shaped [B, C, D, H, W].")
+    if images.ndim != 5 or source_vessel_mask.ndim != 5:
+        raise ValueError("images and source_vessel_mask must be [B, C, D, H, W]")
 
-    roi_d, roi_h, roi_w = _normalize_roi_size(roi_size)
-    blurred = F.avg_pool3d(
-        image,
-        kernel_size=(max(3, roi_d // 2 * 2 + 1), max(3, roi_h // 2 * 2 + 1), max(3, roi_w // 2 * 2 + 1)),
-        stride=1,
-        padding=(max(1, roi_d // 2), max(1, roi_h // 2), max(1, roi_w // 2)),
-    )
-    perturbed = image.clone()
+    dilated = _dilate(source_vessel_mask, dilation_iterations)
+    result = images.clone()
+    for batch_index in range(images.shape[0]):
+        for channel_index in range(images.shape[1]):
+            result[batch_index, channel_index] = _inpaint_volume(
+                images[batch_index, channel_index], dilated[batch_index, 0]
+            )
+    return result
 
-    for batch_idx in range(image.shape[0]):
-        centers = _sample_centers(vessel_mask[batch_idx, 0], num_regions)
-        if centers.numel() == 0:
+
+def _gaussian_patch(size: int, sigma: float, device, dtype) -> torch.Tensor:
+    coordinate = torch.arange(size, device=device, dtype=dtype) - (size - 1) / 2
+    yy, xx = torch.meshgrid(coordinate, coordinate, indexing="ij")
+    return torch.exp(-(xx.square() + yy.square()) / (2 * sigma * sigma))
+
+
+@torch.no_grad()
+def build_pseudo_break_view(
+    images: torch.Tensor,
+    inpainted: torch.Tensor,
+    teacher_vessel_mask: torch.Tensor,
+    num_centers: int = 6,
+    patch_size: int = 15,
+    sigma: float = 3.0,
+) -> torch.Tensor:
+    """Blend inpainted content at vessel-centred 2-D patches (paper Eqs. 5-7)."""
+    if patch_size % 2 != 1:
+        raise ValueError("patch_size must be odd")
+    blend_mask = torch.zeros_like(teacher_vessel_mask)
+    kernel = _gaussian_patch(patch_size, sigma, images.device, images.dtype)
+    radius = patch_size // 2
+
+    for batch_index in range(images.shape[0]):
+        coordinates = torch.nonzero(teacher_vessel_mask[batch_index, 0] > 0, as_tuple=False)
+        if coordinates.numel() == 0:
             continue
+        count = min(num_centers, coordinates.shape[0])
+        coordinates = coordinates[
+            torch.randperm(coordinates.shape[0], device=coordinates.device)[:count]
+        ]
+        for depth, height, width in coordinates.tolist():
+            h0, h1 = max(0, height - radius), min(images.shape[3], height + radius + 1)
+            w0, w1 = max(0, width - radius), min(images.shape[4], width + radius + 1)
+            kh0, kw0 = h0 - (height - radius), w0 - (width - radius)
+            local = kernel[kh0 : kh0 + h1 - h0, kw0 : kw0 + w1 - w0]
+            blend_mask[batch_index, 0, depth, h0:h1, w0:w1] = torch.maximum(
+                blend_mask[batch_index, 0, depth, h0:h1, w0:w1], local
+            )
 
-        for center in centers:
-            d, h, w = [int(v.item()) for v in center]
-            d0 = max(0, d - roi_d // 2)
-            d1 = min(image.shape[2], d0 + roi_d)
-            h0 = max(0, h - roi_h // 2)
-            h1 = min(image.shape[3], h0 + roi_h)
-            w0 = max(0, w - roi_w // 2)
-            w1 = min(image.shape[4], w0 + roi_w)
-
-            source_patch = image[batch_idx : batch_idx + 1, :, d0:d1, h0:h1, w0:w1]
-            blur_patch = blurred[batch_idx : batch_idx + 1, :, d0:d1, h0:h1, w0:w1]
-
-            local_mask = vessel_mask[batch_idx : batch_idx + 1, :, d0:d1, h0:h1, w0:w1].float()
-            region_gate = (local_mask > 0).float()
-            mixed_patch = source_patch * (1.0 - break_strength * region_gate) + blur_patch * (break_strength * region_gate)
-            perturbed[batch_idx : batch_idx + 1, :, d0:d1, h0:h1, w0:w1] = mixed_patch
-
-    return perturbed
-
-
-def maybe_apply_random_flip(image: torch.Tensor, probability: float = 0.5) -> torch.Tensor:
-    flipped = image
-    for dim in (-1, -2, -3):
-        if random.random() < probability:
-            flipped = torch.flip(flipped, dims=[dim])
-    return flipped
+    return images + blend_mask * (inpainted - images)
