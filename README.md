@@ -1,6 +1,8 @@
 # DyCo-CTA
 
-Official implementation of **Dynamic Collaborative Continual Test-Time Adaptation for 3D Vessel Segmentation**, accepted as an **Oral paper at MICCAI 2026**.
+> 🎉 **MICCAI 2026 Oral Paper**
+
+Official implementation of **Dynamic Collaborative Continual Test-Time Adaptation for 3D Vessel Segmentation**.
 
 DyCo-CTA adapts a source-trained 3D vessel segmentation model to a non-stationary stream of unlabeled target volumes. It combines three components:
 
