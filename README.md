@@ -61,8 +61,6 @@ python dyco_cta.py \
 
 The default command uses the stable long-stream configuration for the released ADAM source checkpoint: batch size 1, four updates per test volume, learning rate `1e-5`, entropy weight `0.1`, topology weight `0.01`, stochastic restoration factor `0.1`, pseudo-label threshold `0.5`, three mask-dilation iterations, `15 x 15` pseudo-break patches, and persistence threshold `0.7`.
 
-For stability under severe domain shifts, the released configuration applies reliability-aware adaptation. A volume is not used for model updates when the lower entropy of the two collaborative models exceeds `0.003`; its prediction then falls back to the frozen source model. This label-free safeguard follows the reliable-sample filtering principle introduced by [EATA](https://arxiv.org/abs/2204.02610) and prevents uncertain volumes from accumulating harmful gradients.
-
 To run the adaptation settings stated in the paper, pass them explicitly:
 
 ```bash
@@ -72,12 +70,10 @@ python dyco_cta.py \
   --lr 1e-4 \
   --entropy_weight 1.0 \
   --topology_weight 0.05 \
-  --restoration_factor 0.01 \
-  --reliability_entropy_threshold inf \
-  --no-fallback_to_source_on_unreliable
+  --restoration_factor 0.01
 ```
 
-`--source_blend` optionally mixes frozen source logits into the final prediction. `--volume_ratio_min` and `--volume_ratio_max` optionally enable an additional label-free fallback when the adapted foreground volume deviates substantially from the frozen source prediction.
+`--source_blend` optionally mixes frozen source logits into the final prediction. `--volume_ratio_min` and `--volume_ratio_max` optionally enable a label-free fallback when the adapted foreground volume deviates substantially from the frozen source prediction. Both safeguards are disabled by default.
 
 Use `inference.py` to evaluate a source model without adaptation.
 

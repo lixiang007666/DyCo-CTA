@@ -288,13 +288,13 @@ def build_parser():
     parser.add_argument(
         "--reliability_entropy_threshold",
         type=float,
-        default=0.003,
+        default=float("inf"),
         help="Skip adaptation for volumes whose minimum model entropy exceeds this value.",
     )
     parser.add_argument(
         "--fallback_to_source_on_unreliable",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Use frozen source logits when reliability filtering skips adaptation.",
     )
 
