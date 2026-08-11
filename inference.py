@@ -1,6 +1,7 @@
 import os
 import argparse
 import importlib
+from collections import defaultdict
 
 import torch
 import numpy as np
@@ -35,11 +36,15 @@ class Inference:
         self.build_model()
 
     def build_model(self):
-        source_model_path = os.path.join(args.model_root, args.model, f"source_{'_'.join(args.source_domains)}.pth")
+        source_model_path = os.path.join(
+            self.args.model_root,
+            self.args.model,
+            f"source_{'_'.join(self.args.source_domains)}.pth",
+        )
         
-        model_module = importlib.import_module(f"networks.{args.model}")
-        Model = getattr(model_module, args.model)
-        self.model = Model(num_classes=args.out_ch).to(args.device)
+        model_module = importlib.import_module(f"networks.{self.args.model}")
+        Model = getattr(model_module, self.args.model)
+        self.model = Model(num_classes=self.args.out_ch).to(self.args.device)
 
         if os.path.exists(source_model_path):
             print(f"Loading pre-trained model from {source_model_path}")
@@ -51,7 +56,7 @@ class Inference:
             print(f"Pre-trained model not found at {source_model_path}")
             print("Initializing with random weights")
 
-        self.model.train()
+        self.model.eval()
 
     @torch.no_grad()
     def run(self):
@@ -63,6 +68,7 @@ class Inference:
         progress_bar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"[Inference]")
         
         all_metrics = {'dice': [], 'iou': [], 'hd95': []}
+        domain_metrics = defaultdict(lambda: {'dice': [], 'iou': [], 'hd95': []})
         
         for batch_idx, (images, labels, domain_labels) in progress_bar:
             images = images.to(self.device)
@@ -80,12 +86,20 @@ class Inference:
 
             for key in all_metrics:
                 all_metrics[key].append(metrics[key])
+                for domain in domain_labels:
+                    domain_metrics[domain][key].append(metrics[key])
 
         avg_metrics = {key: np.mean(values) for key, values in all_metrics.items()}
 
         print(f"Dice: {avg_metrics['dice']:.4f}")
         print(f"IoU: {avg_metrics['iou']:.4f}")
         print(f"HD95: {avg_metrics['hd95']:.4f}")
+        for domain, values in domain_metrics.items():
+            averages = {key: np.mean(metric_values) for key, metric_values in values.items()}
+            print(
+                f"{domain}: Dice={averages['dice']:.4f} "
+                f"IoU={averages['iou']:.4f} HD95={averages['hd95']:.4f}"
+            )
 
         print("Inference finished")
 
@@ -99,7 +113,7 @@ if __name__ == '__main__':
     parser.add_argument('--target_domains', type=str, nargs='+', default=['IXI-HH', 'IXI-Guys', 'IXI-IOP', 'LocH1', 'ICBM'], 
                        help='Space-separated list of target domains')
     
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--image_size', type=int, nargs='+', default=[256, 256, 128])
     parser.add_argument('--shuffle', action='store_false', default=False)
     parser.add_argument('--augmentation', action='store_true', default=False)

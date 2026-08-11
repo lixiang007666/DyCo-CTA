@@ -1,6 +1,6 @@
 # DyCo-CTA
 
-Official implementation of **Dynamic Collaborative Continual Test-Time Adaptation for 3D Vessel Segmentation**.
+Official implementation of **Dynamic Collaborative Continual Test-Time Adaptation for 3D Vessel Segmentation**, accepted as an **Oral paper at MICCAI 2026**.
 
 DyCo-CTA adapts a source-trained 3D vessel segmentation model to a non-stationary stream of unlabeled target volumes. It combines three components:
 
@@ -57,14 +57,35 @@ python dyco_cta.py \
   --model ResUnet3d
 ```
 
-The defaults reproduce the adaptation settings reported in the paper: batch size 1, four updates per test volume, learning rate `1e-4`, pseudo-label threshold `0.5`, three mask-dilation iterations, `15 x 15` pseudo-break patches, and persistence threshold `0.7`.
+The default command uses the stable long-stream configuration for the released ADAM source checkpoint: batch size 1, four updates per test volume, learning rate `1e-5`, entropy weight `0.1`, topology weight `0.01`, stochastic restoration factor `0.1`, pseudo-label threshold `0.5`, three mask-dilation iterations, `15 x 15` pseudo-break patches, and persistence threshold `0.7`.
+
+To run the adaptation settings stated in the paper, pass them explicitly:
+
+```bash
+python dyco_cta.py \
+  --source_domains ADAM \
+  --target_domains IXI-HH IXI-Guys IXI-IOP LocH1 ICBM \
+  --lr 1e-4 \
+  --entropy_weight 1.0 \
+  --topology_weight 0.05 \
+  --restoration_factor 0.01
+```
+
+`--source_blend` optionally mixes frozen source logits into the final prediction. `--volume_ratio_min` and `--volume_ratio_max` optionally enable a label-free fallback when the adapted foreground volume deviates substantially from the frozen source prediction. Both safeguards are disabled by default.
 
 Use `inference.py` to evaluate a source model without adaptation.
 
 ## Acknowledgements
 
-The dynamic collaboration design builds on [DiCo](https://github.com/xujiaommcome/DiCo), and the pseudo-break transformation builds on [CoLeTra](https://github.com/jmlipman/CoLeTra).
+The dynamic collaboration design builds on [DiCo](https://github.com/lixiangcog/DiCo), and the pseudo-break transformation builds on [CoLeTra](https://github.com/lixiangcog/CoLeTra).
 
 ## Citation
 
-Citation information will be added after publication.
+```bibtex
+@inproceedings{li2026dycocta,
+  title={Dynamic Collaborative Continual Test-Time Adaptation for 3D Vessel Segmentation},
+  author={Li, Xiang and Fang, Yuqi and Zhang, Dan and Zhang, Jiong and Shan, Caifeng},
+  booktitle={International Conference on Medical Image Computing and Computer-Assisted Intervention},
+  year={2026}
+}
+```

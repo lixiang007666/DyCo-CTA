@@ -2,6 +2,7 @@ import argparse
 import copy
 import importlib
 import os
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -22,6 +23,10 @@ class DyCoCTA3D:
     def __init__(self, args):
         self.args = args
         self.device = args.device
+        if not 0.0 <= args.source_blend <= 1.0:
+            raise ValueError("source_blend must be between 0 and 1")
+        if args.volume_ratio_min < 0 or args.volume_ratio_min > args.volume_ratio_max:
+            raise ValueError("volume ratio bounds are invalid")
         self.build_models()
         self.configure_optimizers()
 
@@ -85,6 +90,17 @@ class DyCoCTA3D:
                 betas=(self.args.beta1, self.args.beta2),
             )
 
+    def _reset_adaptation_state(self):
+        self.model_primary.load_state_dict(self.anchor_primary.state_dict())
+        self.model_auxiliary.load_state_dict(self.anchor_auxiliary.state_dict())
+        self.configure_optimizers()
+
+    def _volume_ratio_is_safe(self, adapted_logits, source_logits):
+        adapted_volume = (adapted_logits.argmax(dim=1) == 1).sum().float()
+        source_volume = (source_logits.argmax(dim=1) == 1).sum().float().clamp_min(1.0)
+        ratio = float((adapted_volume / source_volume).item())
+        return self.args.volume_ratio_min <= ratio <= self.args.volume_ratio_max, ratio
+
     def _stochastic_restore(self, model: nn.Module, anchor: nn.Module):
         for model_param, anchor_param in zip(model.parameters(), anchor.parameters()):
             restore_mask = (torch.rand_like(model_param) < self.args.restoration_factor).to(model_param.dtype)
@@ -126,8 +142,9 @@ class DyCoCTA3D:
 
         progress_bar = tqdm(enumerate(train_loader), total=len(train_loader), desc="[DyCo-CTA]")
         all_metrics = {"dice": [], "iou": [], "hd95": []}
+        domain_metrics = defaultdict(lambda: {"dice": [], "iou": [], "hd95": []})
 
-        for batch_idx, (images, labels, _) in progress_bar:
+        for batch_idx, (images, labels, domain_labels) in progress_bar:
             images = images.to(self.device)
             labels = labels.to(self.device)
             inpainted = self._build_inpainted(images)
@@ -193,20 +210,41 @@ class DyCoCTA3D:
                 final_primary = self.model_primary(images)
                 final_auxiliary = self.model_auxiliary(images)
                 selected_logits = final_primary if self._volume_entropy(final_primary).mean() <= self._volume_entropy(final_auxiliary).mean() else final_auxiliary
+                source_logits = self.source_model(images)
+                volume_is_safe, volume_ratio = self._volume_ratio_is_safe(
+                    selected_logits, source_logits
+                )
+                if not volume_is_safe:
+                    selected_logits = source_logits
+                    self._reset_adaptation_state()
+                elif self.args.source_blend > 0:
+                    selected_logits = (
+                        (1.0 - self.args.source_blend) * selected_logits
+                        + self.args.source_blend * source_logits
+                    )
                 metrics = compute_metrics(selected_logits, labels, self.args.out_ch)
 
             progress_bar.set_postfix_str(
-                f"Dice:{metrics['dice']:.3f} Role:{role_flag} Ent1:{entropy_primary.mean().item():.4f} Ent2:{entropy_auxiliary.mean().item():.4f}"
+                f"Dice:{metrics['dice']:.3f} Role:{role_flag} Ratio:{volume_ratio:.2f} "
+                f"Ent1:{entropy_primary.mean().item():.4f} Ent2:{entropy_auxiliary.mean().item():.4f}"
             )
 
             for key in all_metrics:
                 all_metrics[key].append(metrics[key])
+                for domain in domain_labels:
+                    domain_metrics[domain][key].append(metrics[key])
 
         avg_metrics = {key: float(np.mean(values)) for key, values in all_metrics.items()}
         print("\n=== DyCo-CTA Adaptation Finished ===")
         print(f"Avg Dice: {avg_metrics['dice']:.4f}")
         print(f"Avg IoU:  {avg_metrics['iou']:.4f}")
         print(f"Avg HD95: {avg_metrics['hd95']:.4f}")
+        for domain, values in domain_metrics.items():
+            averages = {key: float(np.mean(metric_values)) for key, metric_values in values.items()}
+            print(
+                f"{domain}: Dice={averages['dice']:.4f} "
+                f"IoU={averages['iou']:.4f} HD95={averages['hd95']:.4f}"
+            )
         if self.args.topology_weight > 0 and not TOPOLOGY_BACKEND_AVAILABLE:
             print("Topology regularization was requested but skipped because the topology backend is unavailable.")
 
@@ -215,16 +253,18 @@ def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source_domains", type=str, nargs="+", default=["ADAM"])
     parser.add_argument("--target_domains", type=str, nargs="+", default=["IXI-HH", "IXI-Guys", "IXI-IOP", "LocH1", "ICBM"])
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--image_size", type=int, nargs="+", default=[256, 256, 128])
     parser.add_argument("--shuffle", action="store_true", default=False)
 
     parser.add_argument("--model", type=str, default="ResUnet3d")
     parser.add_argument("--in_ch", type=int, default=1)
     parser.add_argument("--out_ch", type=int, default=2)
+    parser.add_argument("--volume_ratio_min", type=float, default=0.0)
+    parser.add_argument("--volume_ratio_max", type=float, default=float("inf"))
 
     parser.add_argument("--optimizer", type=str, default="Adam")
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.999)
@@ -236,10 +276,16 @@ def build_parser():
     parser.add_argument("--dataset_root", type=str, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--device", type=str, default="cuda:0")
 
-    parser.add_argument("--entropy_weight", type=float, default=1.0)
+    parser.add_argument("--entropy_weight", type=float, default=0.1)
     parser.add_argument("--consistency_weight", type=float, default=1.0)
-    parser.add_argument("--topology_weight", type=float, default=0.05)
-    parser.add_argument("--restoration_factor", type=float, default=0.01)
+    parser.add_argument("--topology_weight", type=float, default=0.01)
+    parser.add_argument("--restoration_factor", type=float, default=0.1)
+    parser.add_argument(
+        "--source_blend",
+        type=float,
+        default=0.0,
+        help="Blend frozen source logits into the final prediction to limit TTA drift.",
+    )
     parser.add_argument("--confidence_threshold", type=float, default=0.0)
 
     parser.add_argument("--break_regions", type=int, default=6)
