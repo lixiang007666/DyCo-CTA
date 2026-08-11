@@ -143,13 +143,33 @@ class DyCoCTA3D:
         progress_bar = tqdm(enumerate(train_loader), total=len(train_loader), desc="[DyCo-CTA]")
         all_metrics = {"dice": [], "iou": [], "hd95": []}
         domain_metrics = defaultdict(lambda: {"dice": [], "iou": [], "hd95": []})
+        skipped_updates = 0
 
         for batch_idx, (images, labels, domain_labels) in progress_bar:
             images = images.to(self.device)
             labels = labels.to(self.device)
-            inpainted = self._build_inpainted(images)
 
-            for _ in range(self.args.adaptation_steps):
+            with torch.no_grad():
+                initial_primary = self.model_primary(images)
+                initial_auxiliary = self.model_auxiliary(images)
+                initial_entropy_primary = self._volume_entropy(initial_primary)
+                initial_entropy_auxiliary = self._volume_entropy(initial_auxiliary)
+                reliability_entropy = min(
+                    initial_entropy_primary.mean().item(),
+                    initial_entropy_auxiliary.mean().item(),
+                )
+
+            role_flag = "no-update"
+            entropy_primary = initial_entropy_primary
+            entropy_auxiliary = initial_entropy_auxiliary
+            adapt_this_volume = reliability_entropy <= self.args.reliability_entropy_threshold
+            if adapt_this_volume:
+                inpainted = self._build_inpainted(images)
+            else:
+                skipped_updates += 1
+                role_flag = "reliable-skip"
+
+            for _ in range(self.args.adaptation_steps if adapt_this_volume else 0):
                 logits_original_primary = self.model_primary(images)
                 logits_original_auxiliary = self.model_auxiliary(images)
                 entropy_primary = self._volume_entropy(logits_original_primary)
@@ -214,7 +234,9 @@ class DyCoCTA3D:
                 volume_is_safe, volume_ratio = self._volume_ratio_is_safe(
                     selected_logits, source_logits
                 )
-                if not volume_is_safe:
+                if not adapt_this_volume and self.args.fallback_to_source_on_unreliable:
+                    selected_logits = source_logits
+                elif not volume_is_safe:
                     selected_logits = source_logits
                     self._reset_adaptation_state()
                 elif self.args.source_blend > 0:
@@ -239,6 +261,7 @@ class DyCoCTA3D:
         print(f"Avg Dice: {avg_metrics['dice']:.4f}")
         print(f"Avg IoU:  {avg_metrics['iou']:.4f}")
         print(f"Avg HD95: {avg_metrics['hd95']:.4f}")
+        print(f"Skipped unreliable updates: {skipped_updates}/{len(train_loader)}")
         for domain, values in domain_metrics.items():
             averages = {key: float(np.mean(metric_values)) for key, metric_values in values.items()}
             print(
@@ -262,6 +285,18 @@ def build_parser():
     parser.add_argument("--out_ch", type=int, default=2)
     parser.add_argument("--volume_ratio_min", type=float, default=0.0)
     parser.add_argument("--volume_ratio_max", type=float, default=float("inf"))
+    parser.add_argument(
+        "--reliability_entropy_threshold",
+        type=float,
+        default=0.003,
+        help="Skip adaptation for volumes whose minimum model entropy exceeds this value.",
+    )
+    parser.add_argument(
+        "--fallback_to_source_on_unreliable",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use frozen source logits when reliability filtering skips adaptation.",
+    )
 
     parser.add_argument("--optimizer", type=str, default="Adam")
     parser.add_argument("--lr", type=float, default=1e-5)
