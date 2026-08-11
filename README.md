@@ -77,9 +77,6 @@ python dyco_cta.py \
 
 Use `inference.py` to evaluate a source model without adaptation.
 
-## Acknowledgements
-
-The dynamic collaboration design builds on [DiCo](https://github.com/lixiangcog/DiCo), and the pseudo-break transformation builds on [CoLeTra](https://github.com/lixiangcog/CoLeTra).
 
 ## Citation
 
